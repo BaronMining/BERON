@@ -1,0 +1,9 @@
+python-dotenv>=1.0.1
+requests>=2.32.0
+SpeechRecognition>=3.10.4
+PyAudio>=0.2.14
+pyttsx3>=2.98
+Pillow>=10.4.0
+psutil>=6.0.0
+pyautogui>=0.9.54
+pystray>=0.19.5
