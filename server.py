@@ -1,8 +1,9 @@
+```python
 import os
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
-from flask_cors import CORS
 import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -10,19 +11,25 @@ app = Flask(__name__)
 CORS(app)
 
 APP_NAME = "BERON"
+
 AI_PROVIDER = os.getenv("BERON_AI_PROVIDER", "openai").lower()
-OPENAI_API_KEY = os.getenv("BERON_OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("BERON_OPENAI_MODEL", "gpt-4o-mini")
-OLLAMA_URL = os.getenv("BERON_OLLAMA_URL", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("BERON_OLLAMA_MODEL", "llama3.2")
+OPENAI_API_KEY = os.getenv("BERON_OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("BERON_OPENAI_MODEL", "gpt-5.6-luna").strip()
 
 SYSTEM_PROMPT = """You are BERON, a personal AI assistant.
+
 Be intelligent, calm, natural, helpful and honest.
+
+You are designed to communicate naturally with your user.
+
 Never claim an action was completed unless the application confirms it.
+
 You may suggest actions, but destructive, financial, security-sensitive,
-or irreversible actions must require explicit confirmation from the user.
+or irreversible actions require explicit confirmation.
+
 Keep normal answers reasonably concise.
 """
+
 
 @app.get("/")
 def home():
@@ -32,114 +39,160 @@ def home():
         "service": "BERON backend"
     })
 
+
 @app.get("/health")
 def health():
-    return jsonify({"status": "healthy", "service": APP_NAME})
+    return jsonify({
+        "status": "healthy",
+        "service": APP_NAME
+    })
+
 
 def ask_openai(messages):
     if not OPENAI_API_KEY:
-        raise RuntimeError("BERON_OPENAI_API_KEY is not configured on the server.")
+        raise RuntimeError(
+            "BERON_OPENAI_API_KEY is not configured on Render."
+        )
 
     response = requests.post(
-        "https://api.openai.com/v1/chat/completions",
+        "https://api.openai.com/v1/responses",
         headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "Content-Type": "application/json",
         },
         json={
             "model": OPENAI_MODEL,
-            "messages": messages,
-            "temperature": 0.7,
+            "instructions": SYSTEM_PROMPT,
+            "input": messages,
         },
         timeout=90,
     )
-    response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
 
-def ask_ollama(messages):
-    response = requests.post(
-        f"{OLLAMA_URL}/api/chat",
-        json={
-            "model": OLLAMA_MODEL,
-            "messages": messages,
-            "stream": False,
-        },
-        timeout=120,
-    )
-    response.raise_for_status()
-    return response.json()["message"]["content"].strip()
+    if not response.ok:
+        try:
+            provider_detail = response.json()
+        except Exception:
+            provider_detail = response.text[:1000]
+
+        raise RuntimeError(
+            f"OpenAI HTTP {response.status_code}: {provider_detail}"
+        )
+
+    data = response.json()
+
+    # Responses API normally provides output_text.
+    answer = data.get("output_text")
+
+    if not answer:
+        # Fallback extraction if output_text is unavailable.
+        parts = []
+
+        for item in data.get("output", []):
+            if item.get("type") != "message":
+                continue
+
+            for content in item.get("content", []):
+                if content.get("type") == "output_text":
+                    text = content.get("text", "")
+                    if text:
+                        parts.append(text)
+
+        answer = "\n".join(parts).strip()
+
+    if not answer:
+        raise RuntimeError(
+            "OpenAI returned successfully, but BERON could not find text in the response."
+        )
+
+    return answer.strip()
+
 
 @app.post("/api/chat")
 def chat():
     body = request.get_json(silent=True) or {}
+
     message = str(body.get("message", "")).strip()
 
     if not message:
-        return jsonify({"error": "message is required"}), 400
+        return jsonify({
+            "error": "message is required"
+        }), 400
 
     history = body.get("history", [])
+
     if not isinstance(history, list):
         history = []
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = []
 
-    # Keep the backend bounded so a client cannot send an enormous conversation.
+    # Keep the backend bounded.
     for item in history[-20:]:
         if not isinstance(item, dict):
             continue
+
         role = item.get("role")
         content = item.get("content")
-        if role in ("user", "assistant") and isinstance(content, str):
-            messages.append({"role": role, "content": content[:8000]})
 
-    messages.append({"role": "user", "content": message})
+        if role in ("user", "assistant") and isinstance(content, str):
+            messages.append({
+                "role": role,
+                "content": content[:8000]
+            })
+
+    messages.append({
+        "role": "user",
+        "content": message
+    })
 
     try:
-        if AI_PROVIDER == "ollama":
-            answer = ask_ollama(messages)
-        else:
-            answer = ask_openai(messages)
+        if AI_PROVIDER != "openai":
+            return jsonify({
+                "error": "Unsupported AI provider",
+                "detail": AI_PROVIDER
+            }), 500
+
+        answer = ask_openai(messages)
 
         return jsonify({
             "assistant": APP_NAME,
-            "message": answer,
+            "message": answer
         })
 
-    except requests.HTTPError as exc:
-        detail = ""
-        if exc.response is not None:
-            try:
-                detail = exc.response.json()
-            except Exception:
-                detail = exc.response.text[:500]
+    except Exception as exc:
+        # Return useful diagnostic information while we are testing.
+        # Do NOT include the API key in this response.
         return jsonify({
             "error": "AI provider request failed",
-            "detail": detail,
+            "detail": str(exc)
         }), 502
 
-    except Exception as exc:
-        return jsonify({
-            "error": "BERON could not process the request",
-            "detail": str(exc),
-        }), 500
 
 @app.post("/api/command")
 def command():
     body = request.get_json(silent=True) or {}
-    command = str(body.get("command", "")).strip()
 
-    if not command:
-        return jsonify({"error": "command is required"}), 400
+    command_text = str(
+        body.get("command", "")
+    ).strip()
 
-    # The cloud backend does NOT execute arbitrary Windows commands.
-    # The Windows client will later validate and execute approved tools locally.
+    if not command_text:
+        return jsonify({
+            "error": "command is required"
+        }), 400
+
+    # The cloud backend never executes arbitrary Windows commands.
+    # The future Windows client will validate approved commands locally.
     return jsonify({
         "status": "received",
-        "command": command,
+        "command": command_text,
         "execution": "pending_client_permission"
     })
 
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
+```
