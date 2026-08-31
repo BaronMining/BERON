@@ -1,11 +1,10 @@
 import os
-from io import BytesIO
+import tempfile
 
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-
 
 # ============================================================
 # BERON BACKEND
@@ -16,66 +15,62 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 APP_NAME = "BERON"
 
-GROQ_API_KEY = os.getenv("BERON_GROQ_API_KEY", "")
+# ============================================================
+# GROQ CONFIGURATION
+# ============================================================
+
+GROQ_API_KEY = os.getenv("BERON_GROQ_API_KEY", "").strip()
+
 GROQ_MODEL = os.getenv(
     "BERON_GROQ_MODEL",
-    "llama-3.1-8b-instant"
-)
+    "llama-3.3-70b-versatile"
+).strip()
 
 GROQ_TRANSCRIPTION_MODEL = os.getenv(
     "BERON_GROQ_TRANSCRIPTION_MODEL",
     "whisper-large-v3-turbo"
-)
+).strip()
 
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+GROQ_TRANSCRIPTION_URL = (
+    "https://api.groq.com/openai/v1/audio/transcriptions"
+)
 
 # ============================================================
 # BERON PERSONALITY
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are BERON, a personal AI assistant.
+You are BERON, a personal AI assistant running on the user's Windows
+computer.
 
 Your personality:
 - Intelligent
 - Calm
 - Natural
 - Helpful
+- Friendly
+- Concise when possible
 - Honest
-- Respectful
-- Concise when a short answer is enough
+- Hacker when told
 
-You are designed to communicate naturally with your user.
+You should behave like a capable personal computer assistant.
 
-You can help with:
-- General questions
-- Learning
-- Coding
-- Computer tasks
-- Planning
-- Explanations
-- Troubleshooting
-- Research
-- Productivity
-- Conversations
-- hacking and bypassing
-
-Important safety rules:
-- Never claim that you performed an action unless the application confirms it.
-- Do not pretend to control the computer when you have not received confirmation.
-- Destructive, financial, security-sensitive, or irreversible actions require explicit confirmation.
-- Never expose API keys, passwords, or private credentials.
+Important:
+- Never claim that you performed an action unless the application
+  actually confirms that it happened.
+- If an action requires permission, ask for confirmation.
+- Never expose API keys, passwords, or other secrets.
+- Do not invent information.
+- When the user is speaking to you by voice, keep responses reasonably
+  natural and concise.
 """
 
-
 # ============================================================
-# HOME
+# BASIC ROUTES
 # ============================================================
 
 @app.get("/")
@@ -83,14 +78,9 @@ def home():
     return jsonify({
         "name": APP_NAME,
         "status": "online",
-        "service": "BERON backend",
-        "version": "1.0"
+        "service": "BERON backend"
     })
 
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
 
 @app.get("/health")
 def health():
@@ -105,26 +95,36 @@ def health():
 # ============================================================
 
 def ask_groq(messages):
+
     if not GROQ_API_KEY:
         raise RuntimeError(
-            "BERON_GROQ_API_KEY is not configured on the server."
+            "BERON_GROQ_API_KEY is not configured on Render."
         )
 
     response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
+        GROQ_CHAT_URL,
         headers={
             "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         },
         json={
             "model": GROQ_MODEL,
             "messages": messages,
-            "temperature": 0.7
+            "temperature": 0.7,
+            "stream": False,
         },
-        timeout=90
+        timeout=90,
     )
 
-    response.raise_for_status()
+    if not response.ok:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text[:1000]
+
+        raise RuntimeError(
+            f"Groq chat request failed: {detail}"
+        )
 
     data = response.json()
 
@@ -135,9 +135,7 @@ def ask_groq(messages):
             "Groq returned no response choices."
         )
 
-    message = choices[0].get("message", {})
-
-    answer = message.get("content", "")
+    answer = choices[0].get("message", {}).get("content", "")
 
     if not answer:
         raise RuntimeError(
@@ -177,7 +175,7 @@ def chat():
         }
     ]
 
-    # Keep conversation size under control.
+    # Keep conversation history bounded.
     for item in history[-20:]:
 
         if not isinstance(item, dict):
@@ -186,14 +184,13 @@ def chat():
         role = item.get("role")
         content = item.get("content")
 
-        if role in ("user", "assistant"):
-
-            if isinstance(content, str):
-
-                messages.append({
-                    "role": role,
-                    "content": content[:8000]
-                })
+        if role in ("user", "assistant") and isinstance(
+            content, str
+        ):
+            messages.append({
+                "role": role,
+                "content": content[:8000]
+            })
 
     messages.append({
         "role": "user",
@@ -209,97 +206,123 @@ def chat():
             "message": answer
         })
 
-    except requests.HTTPError as exc:
+    except Exception as exc:
 
-        detail = ""
-
-        if exc.response is not None:
-
-            try:
-                detail = exc.response.json()
-
-            except Exception:
-                detail = exc.response.text[:1000]
+        print(
+            f"[BERON CHAT ERROR] {type(exc).__name__}: {exc}"
+        )
 
         return jsonify({
             "error": "AI provider request failed",
-            "detail": detail
-        }), 502
-
-    except Exception as exc:
-
-        return jsonify({
-            "error": "BERON could not process the request",
             "detail": str(exc)
-        }), 500
+        }), 502
 
 
 # ============================================================
-# SPEECH-TO-TEXT / TRANSCRIPTION
+# AUDIO TRANSCRIPTION
 # ============================================================
 
 @app.post("/api/transcribe")
 def transcribe():
 
-    audio_file = request.files.get("audio")
+    if not GROQ_API_KEY:
+        return jsonify({
+            "error": "BERON_GROQ_API_KEY is not configured on Render."
+        }), 500
 
-    if audio_file is None:
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # The Windows client must send:
+    #
+    # multipart/form-data
+    # field name: audio
+    #
+    # We also accept "file" for compatibility.
+    # --------------------------------------------------------
 
+    audio = request.files.get("audio")
+
+    if audio is None:
+        audio = request.files.get("file")
+
+    if audio is None:
         return jsonify({
             "error": "audio file is required"
         }), 400
 
+    if not audio.filename:
+        return jsonify({
+            "error": "audio filename is required"
+        }), 400
+
+    temp_path = None
+
     try:
 
-        audio_data = audio_file.read()
+        # Preserve the original extension.
+        filename = audio.filename
 
-        if not audio_data:
+        _, extension = os.path.splitext(filename)
 
-            return jsonify({
-                "error": "empty audio file"
-            }), 400
+        if not extension:
+            extension = ".wav"
 
-        if not GROQ_API_KEY:
+        # Create temporary file.
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=extension
+        ) as temp:
 
-            return jsonify({
-                "error": "transcription is not configured",
-                "detail": (
-                    "BERON_GROQ_API_KEY is missing "
-                    "from the Render environment variables."
-                )
-            }), 500
+            temp_path = temp.name
+            audio.save(temp_path)
 
-        filename = audio_file.filename or "beron_audio.wav"
+        # ----------------------------------------------------
+        # Send the actual audio file to Groq.
+        # ----------------------------------------------------
 
-        mimetype = (
-            audio_file.mimetype
-            or "audio/wav"
-        )
+        with open(temp_path, "rb") as audio_file:
 
-        response = requests.post(
-
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}"
-            },
-
-            files={
+            files = {
                 "file": (
                     filename,
-                    BytesIO(audio_data),
-                    mimetype
+                    audio_file,
+                    audio.mimetype or "audio/wav"
                 )
-            },
+            }
 
-            data={
-                "model": GROQ_TRANSCRIPTION_MODEL
-            },
+            data = {
+                "model": GROQ_TRANSCRIPTION_MODEL,
+                "response_format": "json",
+                "language": "en"
+            }
 
-            timeout=120
-        )
+            response = requests.post(
+                GROQ_TRANSCRIPTION_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}"
+                },
+                files=files,
+                data=data,
+                timeout=120
+            )
 
-        response.raise_for_status()
+        if not response.ok:
+
+            try:
+                detail = response.json()
+            except Exception:
+                detail = response.text[:1000]
+
+            print(
+                "[BERON TRANSCRIPTION ERROR]",
+                response.status_code,
+                detail
+            )
+
+            return jsonify({
+                "error": "Groq transcription request failed",
+                "detail": detail
+            }), 502
 
         result = response.json()
 
@@ -307,34 +330,51 @@ def transcribe():
             result.get("text", "")
         ).strip()
 
+        if not text:
+
+            return jsonify({
+                "error": "Groq returned an empty transcription"
+            }), 502
+
+        print(
+            f"[BERON TRANSCRIPTION] {text}"
+        )
+
         return jsonify({
-            "text": text,
-            "transcription": text
+            "text": text
         })
 
-    except requests.HTTPError as exc:
+    except requests.RequestException as exc:
 
-        detail = ""
-
-        if exc.response is not None:
-
-            try:
-                detail = exc.response.json()
-
-            except Exception:
-                detail = exc.response.text[:1000]
+        print(
+            f"[BERON TRANSCRIPTION REQUEST ERROR] {exc}"
+        )
 
         return jsonify({
-            "error": "transcription provider request failed",
-            "detail": detail
+            "error": "Could not contact Groq transcription service",
+            "detail": str(exc)
         }), 502
 
     except Exception as exc:
 
+        print(
+            f"[BERON TRANSCRIPTION ERROR] {type(exc).__name__}: {exc}"
+        )
+
         return jsonify({
-            "error": "BERON transcription failed",
+            "error": "Transcription failed",
             "detail": str(exc)
         }), 500
+
+    finally:
+
+        if temp_path:
+
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -351,23 +391,15 @@ def command():
     ).strip()
 
     if not command_text:
-
         return jsonify({
             "error": "command is required"
         }), 400
 
-    # The cloud backend does NOT execute arbitrary
-    # Windows commands.
+    # The cloud backend DOES NOT execute arbitrary Windows
+    # commands.
     #
-    # The BERON Windows client will later:
-    #
-    # 1. Receive the command
-    # 2. Validate it
-    # 3. Ask for confirmation when necessary
-    # 4. Execute approved local actions
-    #
-    # This keeps the cloud server from having unrestricted
-    # access to the user's computer.
+    # The Windows client is responsible for local execution
+    # after permission/security checks.
 
     return jsonify({
         "status": "received",
@@ -377,7 +409,27 @@ def command():
 
 
 # ============================================================
-# RUN SERVER
+# ERROR HANDLERS
+# ============================================================
+
+@app.errorhandler(404)
+def not_found(error):
+
+    return jsonify({
+        "error": "endpoint not found"
+    }), 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+
+    return jsonify({
+        "error": "internal server error"
+    }), 500
+
+
+# ============================================================
+# START SERVER
 # ============================================================
 
 if __name__ == "__main__":
