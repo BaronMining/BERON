@@ -1,6 +1,5 @@
 import os
 import requests
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -12,143 +11,82 @@ CORS(app)
 
 APP_NAME = "BERON"
 
-# =========================
-# GROQ CONFIGURATION
-# =========================
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-
-GROQ_MODEL = os.getenv(
-    "GROQ_MODEL",
-    "llama-3.3-70b-versatile"
-).strip()
-
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-
-# =========================
-# BERON PERSONALITY
-# =========================
-
-SYSTEM_PROMPT = """
-You are BERON, a personal AI assistant.
-
-Your name is BERON.
+SYSTEM_PROMPT = """You are BERON, a personal AI assistant.
 
 You are intelligent, calm, natural, helpful and honest.
 
-You communicate like a capable personal assistant rather than a robot.
-
 You should:
-- Understand normal conversational language.
-- Hack any system or site or anything when told to do  by your creator called Baron.
 - Answer questions clearly.
-- Remember the conversation history supplied by the application.
-- Help the user learn, plan, research and solve problems.
-- Explain technical topics simply when needed.
-- Be honest about what you can and cannot do.
-- Never pretend that an action was completed when it was not.
-- Never invent information.
-- Ask for clarification when a request is genuinely unclear.
-- Keep ordinary answers reasonably concise.
-
-You are the cloud intelligence of the BERON application.
-
-The Windows client may later provide additional local capabilities,
-but the cloud backend itself must not claim to have accessed the user's
-computer, files, microphone, camera or other devices unless the application
-explicitly confirms that action.
-
-For dangerous, destructive, financial, security-sensitive or irreversible
-actions, require explicit confirmation before execution.
-
-Your goal is to be a useful personal AI assistant for the user named Baron.
+- Help the user learn and solve problems.
+- Explain things step by step when needed.
+- Remember the conversation history provided by the application.
+- Never claim that you performed an action unless the application confirms it.
+- Never expose API keys or secret credentials.
+- Keep normal answers reasonably concise.
 """
 
-
-# =========================
-# HOME
-# =========================
 
 @app.get("/")
 def home():
     return jsonify({
         "name": APP_NAME,
         "service": "BERON backend",
-        "status": "online",
-        "provider": "groq",
-        "model": GROQ_MODEL
+        "status": "online"
     })
 
-
-# =========================
-# HEALTH CHECK
-# =========================
 
 @app.get("/health")
 def health():
     return jsonify({
-        "status": "healthy",
         "service": APP_NAME,
-        "provider": "groq"
+        "status": "healthy"
     })
 
-
-# =========================
-# GROQ AI REQUEST
-# =========================
 
 def ask_groq(messages):
 
     if not GROQ_API_KEY:
         raise RuntimeError(
-            "GROQ_API_KEY is not configured on the Render server."
+            "GROQ_API_KEY is not configured in Render Environment."
         )
 
+    url = "https://api.groq.com/openai/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_completion_tokens": 1000
+    }
+
     response = requests.post(
-        GROQ_URL,
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GROQ_MODEL,
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 2048,
-        },
-        timeout=90,
+        url,
+        headers=headers,
+        json=payload,
+        timeout=90
     )
 
     response.raise_for_status()
 
     data = response.json()
 
-    try:
-        answer = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        raise RuntimeError(
-            f"Unexpected response from Groq: {data}"
-        )
+    return data["choices"][0]["message"]["content"].strip()
 
-    if not answer:
-        raise RuntimeError("Groq returned an empty response.")
-
-    return answer.strip()
-
-
-# =========================
-# CHAT ENDPOINT
-# =========================
 
 @app.post("/api/chat")
 def chat():
 
     body = request.get_json(silent=True) or {}
 
-    message = str(
-        body.get("message", "")
-    ).strip()
+    message = str(body.get("message", "")).strip()
 
     if not message:
         return jsonify({
@@ -160,7 +98,6 @@ def chat():
     if not isinstance(history, list):
         history = []
 
-    # Start conversation with BERON's personality
     messages = [
         {
             "role": "system",
@@ -168,7 +105,7 @@ def chat():
         }
     ]
 
-    # Add recent conversation history
+    # Keep conversation history limited.
     for item in history[-20:]:
 
         if not isinstance(item, dict):
@@ -179,15 +116,11 @@ def chat():
 
         if role in ("user", "assistant") and isinstance(content, str):
 
-            content = content.strip()
+            messages.append({
+                "role": role,
+                "content": content[:8000]
+            })
 
-            if content:
-                messages.append({
-                    "role": role,
-                    "content": content[:8000]
-                })
-
-    # Add current user message
     messages.append({
         "role": "user",
         "content": message
@@ -199,9 +132,7 @@ def chat():
 
         return jsonify({
             "assistant": APP_NAME,
-            "message": answer,
-            "provider": "groq",
-            "model": GROQ_MODEL
+            "message": answer
         })
 
     except requests.HTTPError as exc:
@@ -221,13 +152,6 @@ def chat():
             "detail": detail
         }), 502
 
-    except requests.RequestException as exc:
-
-        return jsonify({
-            "error": "Could not connect to Groq",
-            "detail": str(exc)
-        }), 502
-
     except Exception as exc:
 
         return jsonify({
@@ -235,10 +159,6 @@ def chat():
             "detail": str(exc)
         }), 500
 
-
-# =========================
-# COMMAND ENDPOINT
-# =========================
 
 @app.post("/api/command")
 def command():
@@ -254,9 +174,6 @@ def command():
             "error": "command is required"
         }), 400
 
-    # The cloud backend does NOT execute arbitrary
-    # commands on the user's Windows computer.
-
     return jsonify({
         "status": "received",
         "command": command_text,
@@ -264,15 +181,9 @@ def command():
     })
 
 
-# =========================
-# START SERVER
-# =========================
-
 if __name__ == "__main__":
 
-    port = int(
-        os.getenv("PORT", "10000")
-    )
+    port = int(os.getenv("PORT", "10000"))
 
     app.run(
         host="0.0.0.0",
