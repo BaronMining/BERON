@@ -1,4 +1,3 @@
-```python
 import os
 import requests
 from flask import Flask, request, jsonify
@@ -14,24 +13,32 @@ APP_NAME = "BERON"
 
 AI_PROVIDER = os.getenv("BERON_AI_PROVIDER", "openai").lower()
 OPENAI_API_KEY = os.getenv("BERON_OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("BERON_OPENAI_MODEL", "gpt-5.6-luna").strip()
+OPENAI_MODEL = os.getenv("BERON_OPENAI_MODEL", "gpt-4o-mini").strip()
 
-SYSTEM_PROMPT = """You are BERON, a personal AI assistant.
+SYSTEM_PROMPT = """
+You are BERON, a personal AI assistant.
 
-Be intelligent, calm, natural, helpful and honest.
+Your personality is intelligent, calm, natural, helpful and honest.
 
-You are designed to communicate naturally with your user.
+You communicate with the user naturally, like a capable personal assistant.
 
-Never claim an action was completed unless the application confirms it.
+You must never claim that you completed an action unless the application
+actually confirms that the action was completed.
 
 You may suggest actions, but destructive, financial, security-sensitive,
-or irreversible actions require explicit confirmation.
+or irreversible actions require explicit confirmation from the user.
 
 Keep normal answers reasonably concise.
+
+When you do not know something, say so honestly.
 """
 
 
-@app.get("/")
+# ---------------------------------------------------------
+# HOME
+# ---------------------------------------------------------
+
+@app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "name": APP_NAME,
@@ -40,7 +47,11 @@ def home():
     })
 
 
-@app.get("/health")
+# ---------------------------------------------------------
+# HEALTH CHECK
+# ---------------------------------------------------------
+
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "healthy",
@@ -48,27 +59,45 @@ def health():
     })
 
 
+# ---------------------------------------------------------
+# OPENAI
+# ---------------------------------------------------------
+
 def ask_openai(messages):
+
     if not OPENAI_API_KEY:
         raise RuntimeError(
             "BERON_OPENAI_API_KEY is not configured on Render."
         )
 
+    url = "https://api.openai.com/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            }
+        ] + messages,
+        "temperature": 0.7
+    }
+
     response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": OPENAI_MODEL,
-            "instructions": SYSTEM_PROMPT,
-            "input": messages,
-        },
-        timeout=90,
+        url,
+        headers=headers,
+        json=payload,
+        timeout=90
     )
 
+    # If OpenAI rejects the request, preserve its error.
     if not response.ok:
+
         try:
             provider_detail = response.json()
         except Exception:
@@ -80,38 +109,37 @@ def ask_openai(messages):
 
     data = response.json()
 
-    # Responses API normally provides output_text.
-    answer = data.get("output_text")
+    choices = data.get("choices", [])
 
-    if not answer:
-        # Fallback extraction if output_text is unavailable.
-        parts = []
+    if not choices:
+        raise RuntimeError(
+            "OpenAI returned no choices."
+        )
 
-        for item in data.get("output", []):
-            if item.get("type") != "message":
-                continue
+    message = choices[0].get("message", {})
 
-            for content in item.get("content", []):
-                if content.get("type") == "output_text":
-                    text = content.get("text", "")
-                    if text:
-                        parts.append(text)
-
-        answer = "\n".join(parts).strip()
+    answer = message.get("content", "")
 
     if not answer:
         raise RuntimeError(
-            "OpenAI returned successfully, but BERON could not find text in the response."
+            "OpenAI returned an empty response."
         )
 
     return answer.strip()
 
 
-@app.post("/api/chat")
+# ---------------------------------------------------------
+# CHAT
+# ---------------------------------------------------------
+
+@app.route("/api/chat", methods=["POST"])
 def chat():
+
     body = request.get_json(silent=True) or {}
 
-    message = str(body.get("message", "")).strip()
+    message = str(
+        body.get("message", "")
+    ).strip()
 
     if not message:
         return jsonify({
@@ -125,8 +153,9 @@ def chat():
 
     messages = []
 
-    # Keep the backend bounded.
+    # Keep only the last 20 messages.
     for item in history[-20:]:
+
         if not isinstance(item, dict):
             continue
 
@@ -134,21 +163,25 @@ def chat():
         content = item.get("content")
 
         if role in ("user", "assistant") and isinstance(content, str):
+
             messages.append({
                 "role": role,
                 "content": content[:8000]
             })
 
+    # Add current user message.
     messages.append({
         "role": "user",
         "content": message
     })
 
     try:
+
         if AI_PROVIDER != "openai":
+
             return jsonify({
                 "error": "Unsupported AI provider",
-                "detail": AI_PROVIDER
+                "provider": AI_PROVIDER
             }), 500
 
         answer = ask_openai(messages)
@@ -159,16 +192,20 @@ def chat():
         })
 
     except Exception as exc:
-        # Return useful diagnostic information while we are testing.
-        # Do NOT include the API key in this response.
+
         return jsonify({
             "error": "AI provider request failed",
             "detail": str(exc)
         }), 502
 
 
-@app.post("/api/command")
+# ---------------------------------------------------------
+# COMMAND
+# ---------------------------------------------------------
+
+@app.route("/api/command", methods=["POST"])
 def command():
+
     body = request.get_json(silent=True) or {}
 
     command_text = str(
@@ -176,12 +213,18 @@ def command():
     ).strip()
 
     if not command_text:
+
         return jsonify({
             "error": "command is required"
         }), 400
 
-    # The cloud backend never executes arbitrary Windows commands.
-    # The future Windows client will validate approved commands locally.
+    # IMPORTANT:
+    # The cloud backend does NOT execute arbitrary commands
+    # on your Windows computer.
+    #
+    # Later, the BERON Windows client will receive approved
+    # commands and ask for permission before executing them.
+
     return jsonify({
         "status": "received",
         "command": command_text,
@@ -189,10 +232,17 @@ def command():
     })
 
 
+# ---------------------------------------------------------
+# START SERVER
+# ---------------------------------------------------------
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
+
+    port = int(
+        os.getenv("PORT", "10000")
+    )
+
     app.run(
         host="0.0.0.0",
         port=port
     )
-```
