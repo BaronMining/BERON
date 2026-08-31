@@ -1,4 +1,3 @@
-import time
 from voice.listener import VoiceListener
 from voice.speaker import Speaker
 from core.brain import Brain
@@ -17,52 +16,24 @@ class BERON:
         self.listener = VoiceListener()
 
     def handle(self, text: str):
-        text = text.strip()
-
-        if not text:
+        if not text.strip():
             return
 
-        print(f"[BERON] Processing: {text}")
+        print(f"[BERON USER] {text}")
 
-        try:
-            self.memory.add("user", text)
+        self.memory.add("user", text)
 
-            print("[BERON] Sending to brain...")
+        result = self.brain.respond(text)
 
-            result = self.brain.respond(text)
+        if not result:
+            return
 
-            if not result:
-                result = "I heard you, but I didn't receive a response."
+        self.memory.add("assistant", result)
 
-            result = str(result).strip()
-
-            print(f"[BERON] Reply: {result}")
-
-            self.memory.add("assistant", result)
-
-            print("[BERON] Speaking...")
-
-            self.speaker.say(result)
-
-            print("[BERON] Done speaking.")
-
-        except Exception as exc:
-            print(f"[BERON ERROR] {type(exc).__name__}: {exc}")
-
-            try:
-                self.speaker.say(
-                    "I heard you, but I had a problem processing that."
-                )
-            except Exception:
-                pass
+        self.speaker.say(result)
 
     def run(self):
-        print("[BERON] Starting...")
-
-        try:
-            self.speaker.say("BERON is online. I am listening.")
-        except Exception as exc:
-            print(f"[SPEAKER ERROR] {exc}")
+        self.speaker.say("BERON is online. I am listening.")
 
         while True:
             try:
@@ -71,18 +42,16 @@ class BERON:
                 if text:
                     self.handle(text)
 
-                time.sleep(0.1)
-
             except KeyboardInterrupt:
-                print("[BERON] Shutting down.")
-
-                try:
-                    self.speaker.say("BERON shutting down.")
-                except Exception:
-                    pass
-
+                self.speaker.say("BERON shutting down.")
                 break
 
             except Exception as exc:
-                print(f"[BERON LOOP ERROR] {type(exc).__name__}: {exc}")
-                time.sleep(1)
+                print(f"[BERON ERROR] {exc}")
+
+                try:
+                    self.speaker.say(
+                        "I encountered an error, but I am still online."
+                    )
+                except Exception:
+                    pass
