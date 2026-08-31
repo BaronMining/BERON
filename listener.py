@@ -5,13 +5,15 @@ import speech_recognition as sr
 
 
 class VoiceListener:
+
     def __init__(self):
+
         self.recognizer = sr.Recognizer()
 
         self.wake_word = os.getenv(
             "BERON_WAKE_WORD",
             "beron"
-        ).lower()
+        ).lower().strip()
 
         self.language = os.getenv(
             "BERON_LANGUAGE",
@@ -24,24 +26,40 @@ class VoiceListener:
         ).rstrip("/")
 
         self.listen_seconds = int(
-            os.getenv("BERON_LISTEN_SECONDS", "5")
+            os.getenv(
+                "BERON_LISTEN_SECONDS",
+                "5"
+            )
         )
 
+        # Prevent the microphone from being too sensitive.
+        self.recognizer.energy_threshold = 300
+
+        self.recognizer.dynamic_energy_threshold = True
+
+        self.recognizer.pause_threshold = 0.8
+
+        self.recognizer.phrase_threshold = 0.3
+
+        self.recognizer.non_speaking_duration = 0.5
+
     def record_audio(self):
-        """
-        Record microphone audio and return the SpeechRecognition
-        AudioData object.
-        """
 
         with sr.Microphone() as source:
+
             print(
                 f"Listening for {self.listen_seconds} seconds..."
             )
 
-            self.recognizer.adjust_for_ambient_noise(
-                source,
-                duration=0.5
-            )
+            try:
+                self.recognizer.adjust_for_ambient_noise(
+                    source,
+                    duration=0.5
+                )
+            except Exception as exc:
+                print(
+                    f"Microphone calibration warning: {exc}"
+                )
 
             audio = self.recognizer.listen(
                 source,
@@ -51,38 +69,12 @@ class VoiceListener:
 
         return audio
 
-    def transcribe_local(self, audio):
-        """
-        Local fallback using Google's speech recognition service.
-        """
-
-        try:
-            text = self.recognizer.recognize_google(
-                audio,
-                language=self.language
-            )
-
-            return text.strip()
-
-        except sr.UnknownValueError:
-            return ""
-
-        except sr.RequestError as exc:
-            print(f"Speech recognition error: {exc}")
-            return ""
-
     def transcribe_backend(self, audio):
-        """
-        Send the recorded WAV audio to the BERON backend.
-
-        IMPORTANT:
-        The Flask backend expects the multipart field to be named
-        'audio'.
-        """
 
         temp_path = None
 
         try:
+
             wav_data = audio.get_wav_data()
 
             with tempfile.NamedTemporaryFile(
@@ -91,9 +83,13 @@ class VoiceListener:
             ) as temp_file:
 
                 temp_file.write(wav_data)
+
                 temp_path = temp_file.name
 
-            with open(temp_path, "rb") as audio_file:
+            with open(
+                temp_path,
+                "rb"
+            ) as audio_file:
 
                 response = requests.post(
                     f"{self.backend_url}/api/transcribe",
@@ -110,9 +106,11 @@ class VoiceListener:
                 )
 
             if response.status_code != 200:
+
                 print(
-                    f"Transcription endpoint returned "
-                    f"{response.status_code}: {response.text}"
+                    "Transcription endpoint returned "
+                    f"{response.status_code}: "
+                    f"{response.text[:1000]}"
                 )
 
                 return ""
@@ -131,8 +129,7 @@ class VoiceListener:
         except requests.RequestException as exc:
 
             print(
-                f"Could not connect to BERON transcription "
-                f"service: {exc}"
+                f"Backend transcription connection error: {exc}"
             )
 
             return ""
@@ -140,53 +137,77 @@ class VoiceListener:
         except Exception as exc:
 
             print(
-                f"Transcription error: {exc}"
+                f"Backend transcription error: {exc}"
             )
 
             return ""
 
         finally:
 
-            if temp_path and os.path.exists(temp_path):
+            if (
+                temp_path
+                and os.path.exists(temp_path)
+            ):
 
                 try:
                     os.remove(temp_path)
                 except OSError:
                     pass
 
-    def listen(self):
-        """
-        Record audio and try the BERON backend first.
+    def transcribe_local(self, audio):
 
-        If the backend transcription is unavailable,
-        fall back to local SpeechRecognition.
-        """
+        try:
+
+            text = self.recognizer.recognize_google(
+                audio,
+                language=self.language
+            )
+
+            return text.strip()
+
+        except sr.UnknownValueError:
+
+            return ""
+
+        except sr.RequestError as exc:
+
+            print(
+                f"Local speech recognition error: {exc}"
+            )
+
+            return ""
+
+        except Exception as exc:
+
+            print(
+                f"Local transcription error: {exc}"
+            )
+
+            return ""
+
+    def listen(self):
 
         audio = self.record_audio()
 
-        # Try BERON backend first.
+        # First use the BERON/Groq transcription service.
         text = self.transcribe_backend(audio)
 
         if text:
+
             return text
 
         # Local fallback.
-        print("Backend transcription unavailable. Using local speech recognition...")
+        print(
+            "Backend transcription unavailable. "
+            "Using local speech recognition..."
+        )
 
         return self.transcribe_local(audio)
 
     def listen_for_wake_and_command(self):
-        """
-        Wait for the wake word 'BERON'.
-
-        Examples:
-
-        'BERON'
-        'BERON what is the weather'
-        'Hey BERON'
-        """
 
         try:
+
             text = self.listen().strip()
 
         except Exception as exc:
@@ -198,17 +219,21 @@ class VoiceListener:
             return None
 
         if not text:
+
             return None
 
-        print(f"You: {text}")
+        print(
+            f"Heard: {text}"
+        )
 
         low = text.lower()
 
-        # Wake word wasn't spoken.
+        # Check whether BERON was called.
         if self.wake_word not in low:
+
             return None
 
-        # Extract anything said after BERON.
+        # Everything after the wake word.
         command = low.split(
             self.wake_word,
             1
@@ -216,23 +241,44 @@ class VoiceListener:
             " ,.!?"
         )
 
+        # Example:
+        #
+        # "Hey BERON how are you?"
+        #
+        # becomes:
+        #
+        # "how are you?"
+
         if command:
+
             return command
 
-        # User only said "BERON".
-        print("BERON is listening...")
+        # User only said:
+        #
+        # "BERON"
+
+        print(
+            "BERON is listening..."
+        )
 
         try:
+
             command = self.listen().strip()
+
         except Exception as exc:
+
             print(
                 f"Command listening error: {exc}"
             )
+
             return None
 
         if not command:
+
             return None
 
-        print(f"You: {command}")
+        print(
+            f"Heard command: {command}"
+        )
 
         return command
